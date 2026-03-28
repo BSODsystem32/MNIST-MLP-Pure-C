@@ -1,4 +1,21 @@
-data/
-*.o
+# Build artifacts
+src/*.o
+src/mnist_mlp*
+infer/*.o
+infer/infer_export*
+infer/infer_bench*
+infer/infer_single*
+
+# Model weights (large binary files — use git-lfs or store externally)
+models/
 *.bin
-*.exe
+*.inf
+
+# MNIST raw data (download via make download)
+data/
+src/data
+
+# macOS / editor noise
+.DS_Store
+*.swp
+*.swo

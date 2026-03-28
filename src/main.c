@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
     mnist_free(&test_d);
 
     const double end = get_time_ms();
-    printf("Time: %llu ms\n", end - start);
+    printf("Time: %lf ms\n", end - start);
 
     return 0;
 }

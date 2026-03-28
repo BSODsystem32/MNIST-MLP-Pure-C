@@ -1,30 +1,52 @@
-CC      = gcc
-CFLAGS  = -std=c99 -O2 -Wall -Wextra -Wpedantic
-LDFLAGS = -lm
+# Root Makefile
+#
+# Targets:
+#   make            build everything (training + inference)
+#   make train      build training binary only
+#   make infer      build inference binaries only
+#   make export     train then fold BN, writes models/model.inf
+#   make bench      run inference benchmark on test set
+#   make download   fetch MNIST into data/
+#   make clean      remove all build artifacts
 
-TARGET = mnist_mlp
-SRCS   = main.c mnist.c matrix.c network.c
-OBJS   = $(SRCS:.c=.o)
+# ---------------------------------------------------------------
+# OS detection — $(OS) is set to "Windows_NT" by Windows itself
+# (works in cmd.exe, PowerShell, MinGW, MSYS2, Cygwin)
+# ---------------------------------------------------------------
+ifeq ($(OS),Windows_NT)
+  D       := $(strip \)
+  EXE     := .exe
+  MKDIR_P  = if not exist "$(1)" mkdir "$(1)"
+else
+  D       := /
+  EXE     :=
+  MKDIR_P  = mkdir -p $(1)
+endif
 
-.PHONY: all clean run download
+MODELS_DIR = models
+DATA_DIR   = data
 
-all: $(TARGET)
+.PHONY: all train infer export bench download clean
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+all: train infer
 
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+train:
+	$(MAKE) -C src
+
+infer:
+	$(MAKE) -C infer
+
+export: train infer
+	$(call MKDIR_P,$(MODELS_DIR))
+	src$(D)mnist_mlp$(EXE) $(DATA_DIR) $(MODELS_DIR)$(D)weights_v2.bin
+	infer$(D)infer_export$(EXE) $(MODELS_DIR)$(D)weights_v2.bin $(MODELS_DIR)$(D)model.inf
+
+bench: infer
+	infer$(D)infer_bench$(EXE) $(MODELS_DIR)$(D)model.inf $(DATA_DIR)
 
 download:
-	mkdir -p data
-	cd data && for f in train-images-idx3-ubyte train-labels-idx1-ubyte \
-	  t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do \
-	    [ -f $$f ] || (curl -LO "http://yann.lecun.com/exdb/mnist/$${f}.gz" && gunzip "$${f}.gz"); \
-	done
-
-run: all
-	./$(TARGET) ./data weights_v2.bin
+	$(MAKE) -C src download
 
 clean:
-	rm -f $(OBJS) $(TARGET) weights_v2.bin
+	$(MAKE) -C src clean
+	$(MAKE) -C infer clean
