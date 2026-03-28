@@ -2,161 +2,99 @@
 
 ---
 
-# MNIST MLP — Pure-C Neural Network from Scratch
+# MNIST MLP — Pure C End-to-End Neural Network
 
-A fully-connected neural network trained on MNIST, implemented in plain C99 with **no external ML libraries**. Achieves ~98% test accuracy using BatchNorm, Dropout, and SGD with Momentum.
+An end-to-end fully-connected neural network project written entirely in plain C99 from scratch, with **zero external ML library dependencies**. This project is split into two robust parts:
+1. **Training (`src/`)**: Features BatchNorm, Dropout, and SGD with Momentum, achieving ~98% test accuracy on MNIST.
+2. **Inference (`infer/`)**: A bare-metal ready, zero-malloc inference engine that uses **BatchNorm Folding** to aggressively optimize the model for edge devices (e.g., ARM Cortex-M microcontrollers).
 
 ---
 
 ## Network Architecture
 
-```
+**Training Architecture:**
+```text
 Input (784)
   └─► FC1 (256) → BatchNorm → ReLU → Dropout
         └─► FC2 (128) → BatchNorm → ReLU → Dropout
               └─► FC3 (10) → Softmax → Cross-Entropy Loss
 ```
 
-| Layer | Type | Output Size |
-|-------|------|-------------|
-| Input | Flatten 28×28 | 784 |
-| Hidden 1 | FC + BN + ReLU + Dropout | 256 |
-| Hidden 2 | FC + BN + ReLU + Dropout | 128 |
-| Output | FC + Softmax | 10 |
-
-Weight initialization uses **He initialization** (`scale = sqrt(2 / fan_in)`), suitable for ReLU activations.
-
----
-
-## Hyperparameters
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `EPOCHS` | 25 | Training epochs |
-| `BATCH_SIZE` | 128 | Mini-batch size |
-| `LR_INIT` | 0.05 | Initial learning rate |
-| `LR_DECAY` | 0.92 | Per-epoch LR multiplier |
-| `DROPOUT_RATE` | 0.3 | Fraction of neurons dropped during training |
-| `MOMENTUM` | 0.9 | SGD momentum coefficient |
-| `BN_EPS` | 1e-5 | BatchNorm numerical stability constant |
-| `BN_MOMENTUM` | 0.1 | BatchNorm running stats EMA decay |
-
-Learning rate follows an exponential schedule: `lr = LR_INIT × LR_DECAY^epoch`.
+**Inference Architecture (Post-Folding):**
+During deployment, the BatchNorm scale and shift parameters are pre-computed and **folded** directly into the Fully Connected weights and biases.
+```text
+Input (784, uint8)
+  └─► FC1' (256) → ReLU
+        └─► FC2' (128) → ReLU
+              └─► FC3' (10) → Softmax
+```
 
 ---
 
 ## File Structure
 
-```
+```text
 .
-├── main.c       # Entry point: training loop, evaluation, CLI args
-├── network.c    # Forward pass, backward pass, BN, Dropout, save/load
-├── network.h    # Network struct, layer sizes, public API
-├── matrix.c     # Matrix ops: mat_mul, relu, softmax, etc.
-├── matrix.h     # Matrix op declarations
-├── mnist.c      # IDX binary file loader, normalizes pixels to [0, 1]
-├── mnist.h      # MnistData struct
-└── Makefile
+├── Makefile             # Root makefile orchestrating the build
+├── src/                 # Training code (backprop, optimizers, etc.)
+│   ├── main.c, network.c, matrix.c, mnist.c
+├── infer/               # Standalone Inference code (No dependency on src/)
+│   ├── infer.c / .h     # The core engine (portable to MCUs)
+│   ├── export.c         # Folds BN params and converts weights to .inf format
+│   ├── bench.c          # Evaluates accuracy, throughput, and latency
+│   └── single.c         # Single image inference (.pgm/.raw) with ASCII art
+└── data/                # MNIST dataset (auto-downloaded via make)
 ```
 
-### Key implementation details
+### Key Technical Highlights
 
-**`matrix.c`** — All tensor math in row-major flat arrays. Provides three matmul variants (`A@B`, `Aᵀ@B`, `A@Bᵀ`) to avoid explicit transposes during backprop.
-
-**`network.c`** — Contains the full forward and backward pass:
-- `bn_forward` / `bn_backward`: Ioffe & Szegedy (2015) BatchNorm with per-feature mean/variance computed over the batch, and EMA running stats for inference.
-- `dropout_forward` / `dropout_backward`: Inverted dropout — survivors are scaled by `1/(1−p)` at training time so inference requires no rescaling.
-- `MOMENTUM_UPDATE` macro: applies `v = β·v + g`, then `param -= lr·v`.
-- `net_save` / `net_load`: writes weights and BN running stats to a binary file tagged with magic `0x4D4C5002` (`MLP\x02`).
-
-**`mnist.c`** — Reads the IDX3/IDX1 binary format (big-endian), normalizes pixel bytes to `float32` in `[0, 1]`.
+*   **BatchNorm Folding (`infer_export`)**: Reads the training checkpoint (which contains BN running stats), absorbs the BN math into the adjacent FC layers, and spits out a compact ~800 KB inference-only file (`model.inf`).
+*   **Featherweight Inference Engine (`infer.c`)**:
+    *   Zero `malloc` / dynamic allocation in the hot path.
+    *   Accepts raw `uint8_t` (0-255) pixel arrays directly, normalizing on the fly.
+    *   100% portable. Ready for bare-metal cross-compilation.
 
 ---
 
 ## Quick Start
 
-### 1. Get the MNIST data
-
+### 1. Download Data and Build
+Fetch the MNIST dataset and compile both training and inference binaries.
 ```bash
 make download
+make all
 ```
 
-This fetches and decompresses the four IDX files into `./data/`. Requires `curl` and `gunzip`.
-
-> If the LeCun mirror is unavailable, download manually from https://yann.lecun.com/exdb/mnist/ or a mirror, and place the four uncompressed files under `./data/`.
-
-### 2. Build
-
+### 2. Train & Export the Model
+This runs the complete training loop (25 epochs) and automatically invokes `infer_export` to fold BN layers and generate the deployment-ready `models/model.inf`.
 ```bash
-make
+make export
 ```
 
-Requires GCC (or any C99-compatible compiler) and `libm`. Produces the `mnist_mlp` binary.
-
-### 3. Train
-
+### 3. Run Benchmark
+Test the inference engine against the 10,000 test images to measure accuracy, throughput, and latency:
 ```bash
-make run
-# equivalent to:
-./mnist_mlp ./data weights_v2.bin
+make bench
+```
+*Expected Output:*
+```text
+Accuracy: 98.3x%
+Throughput benchmark (10 passes × 10000 samples):
+  Total time:  X.XXX s
+  Throughput:  XXXXX samples/s
+  Latency:     X.XXX ms/sample
 ```
 
-**CLI usage:**
-
-```
-./mnist_mlp [data_dir] [weights_out]
-```
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `data_dir` | `./data` | Directory containing the four IDX files |
-| `weights_out` | `weights_v2.bin` | Output path for saved weights |
-
-### 4. Expected output
-
-```
-Loading MNIST from ./data ...
-Train: 60000   Test: 10000
-
-Config: epochs=25  batch=128  lr=0.050 decay=0.92  dropout=0.3
-        momentum=0.90  BN_eps=1e-05  BN_momentum=0.10
-
-Epoch  LR       Loss       Train%     Test%
-----------------------------------------------
-1      0.05000  0.3142     90.21      97.43
-2      0.04600  0.1823     94.87      97.81
-...
-25     0.00726  0.0401     98.92      98.3x
-----------------------------------------------
-Final test accuracy: 98.3x%
-Saved weights to weights_v2.bin
-Time: XXXXX ms
-```
-
-### 5. Clean
-
+### 4. Single Image Inference
+Pass a 28x28 PGM or raw pixel file to see predictions and an ASCII art preview of the input:
 ```bash
-make clean   # removes object files, binary, and weights_v2.bin
+# If you have your own 28x28 grayscale image:
+./infer/infer_single models/model.inf my_image.pgm
 ```
 
 ---
 
-## Dependencies
+## Cross-Compilation & Edge AI Deployment
 
-- C99-compatible compiler (GCC / Clang)
-- Standard C library (`libc`, `libm`)
-- `curl` + `gunzip` for `make download` only
-
-No BLAS, no PyTorch, no external ML framework.
-
----
-
-## Platform Notes
-
-The timer in `main.c` uses `QueryPerformanceCounter` on Windows and `clock_gettime(CLOCK_MONOTONIC)` on POSIX systems, so the binary compiles on both.
-
----
-
-## License
-
-MIT
+The inference core (`infer.c` and `infer.h`) is intentionally isolated. 
+To deploy this model onto a bare-metal ARM Cortex-M device, simply drop those two files into your embedded project.
