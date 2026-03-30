@@ -3,67 +3,39 @@
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #include "mnist.h"
 #include "network.h"
-
-#ifdef _WIN32
-    #include <windows.h>
-#else
-    #include <time.h>
-    #include <sys/time.h>
-#endif
-
-/* ---------------------------------------------------------------
-   Timer for Windows & Linux
-   --------------------------------------------------------------- */
-double get_time_ms() {
-#ifdef _WIN32
-    // Windows
-    LARGE_INTEGER freq, counter;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&counter);
-    return (double)counter.QuadPart * 1000.0 / freq.QuadPart;
-#else
-    // Linux/POSIX
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
-#endif
-}
+#include "augment.h"
 
 /* ---------------------------------------------------------------
    Hyperparameters
    --------------------------------------------------------------- */
-#define EPOCHS       25
+#define EPOCHS       30
 #define BATCH_SIZE   128
 #define LR_INIT      0.05f
 #define LR_DECAY     0.92f
-#define DROPOUT_RATE 0.3f    /* fraction of neurons to drop */
+#define DROPOUT_RATE 0.3f
 
-/* ---------------------------------------------------------------
-   Fisher-Yates shuffle
-   --------------------------------------------------------------- */
 static void shuffle(int *idx, int n) {
-    for (int i = n - 1; i > 0; i--) {
-        int j = rand() % (i + 1);
+    for (int i = n-1; i > 0; i--) {
+        int j = rand() % (i+1);
         int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
     }
 }
 
-/* ---------------------------------------------------------------
-   Evaluate accuracy (inference mode: no dropout, running BN stats)
-   --------------------------------------------------------------- */
 static float evaluate(Network *net, const MnistData *d) {
     int pixels  = d->rows * d->cols;
     int correct = 0;
     float *batch_x = (float *)malloc(BATCH_SIZE * pixels * sizeof(float));
-
     for (int start = 0; start < d->count; start += BATCH_SIZE) {
         int bs = BATCH_SIZE;
         if (start + bs > d->count) bs = d->count - start;
-        memcpy(batch_x, d->images + start * pixels,
-               bs * pixels * sizeof(float));
-        /* training=0, dropout_rate ignored */
+        memcpy(batch_x, d->images + start*pixels, bs*pixels*sizeof(float));
         net_forward(net, batch_x, bs, 0, 0.0f);
         correct += net_correct(net, d->labels + start, bs);
     }
@@ -72,10 +44,16 @@ static float evaluate(Network *net, const MnistData *d) {
 }
 
 /* ---------------------------------------------------------------
-   Training loop
+   Per-thread augmentation scratch — allocated once, reused every batch
    --------------------------------------------------------------- */
+typedef struct {
+    float dst[AUG_PX];
+    float tmp[AUG_PX];
+    RNG   rng;
+} ThreadScratch;
+
 static void train(Network *net, const MnistData *train_d,
-                  const MnistData *test_d) {
+                  const MnistData *test_d, const AugmentCfg *aug) {
     int pixels = train_d->rows * train_d->cols;
     int n      = train_d->count;
 
@@ -83,10 +61,21 @@ static void train(Network *net, const MnistData *train_d,
     float   *batch_x = (float   *)malloc(BATCH_SIZE * pixels * sizeof(float));
     uint8_t *batch_y = (uint8_t *)malloc(BATCH_SIZE * sizeof(uint8_t));
 
+    /* One scratch struct per thread — avoids false sharing and per-iter malloc */
+    int nthreads = 1;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+#endif
+    ThreadScratch *scratch = (ThreadScratch *)malloc(nthreads * sizeof(ThreadScratch));
+
+    /* Seed each thread's RNG differently */
+    unsigned base = (unsigned)time(NULL);
+    for (int t = 0; t < nthreads; t++)
+        rng_seed(&scratch[t].rng, base ^ (uint32_t)(t * 2654435761u));
+
     for (int i = 0; i < n; i++) idx[i] = i;
 
     float lr = LR_INIT;
-
     printf("%-6s %-8s %-10s %-10s %-10s\n",
            "Epoch", "LR", "Loss", "Train%", "Test%");
     printf("----------------------------------------------\n");
@@ -99,14 +88,27 @@ static void train(Network *net, const MnistData *train_d,
         int   steps         = 0;
 
         for (int start = 0; start + BATCH_SIZE <= n; start += BATCH_SIZE) {
+
+            /* ---- Augment batch in parallel ---- */
+            #ifdef _OPENMP
+
+            #pragma omp parallel for schedule(static)
+
+            #endif
             for (int b = 0; b < BATCH_SIZE; b++) {
-                int s = idx[start + b];
-                memcpy(batch_x + b * pixels,
-                       train_d->images + s * pixels,
-                       pixels * sizeof(float));
-                batch_y[b] = train_d->labels[s];
+                int tid = 0;
+#ifdef _OPENMP
+                tid = omp_get_thread_num();
+#endif
+                ThreadScratch *ts = &scratch[tid];
+                const float *src  = train_d->images + idx[start+b] * pixels;
+
+                augment_apply(ts->dst, src, ts->tmp, &ts->rng, aug);
+                memcpy(batch_x + b * pixels, ts->dst, pixels * sizeof(float));
+                batch_y[b] = train_d->labels[idx[start+b]];
             }
-            /* Forward in training mode */
+
+            /* ---- Forward / backward (matrix ops use OMP internally) ---- */
             net_forward(net, batch_x, BATCH_SIZE, 1, DROPOUT_RATE);
             total_loss    += net_loss(net, batch_y, BATCH_SIZE);
             total_correct += net_correct(net, batch_y, BATCH_SIZE);
@@ -116,33 +118,25 @@ static void train(Network *net, const MnistData *train_d,
 
         float train_acc = 100.0f * total_correct / (steps * BATCH_SIZE);
         float test_acc  = evaluate(net, test_d);
-
         printf("%-6d %-8.5f %-10.4f %-10.2f %-10.2f\n",
-               epoch, lr, total_loss / steps, train_acc, test_acc);
-
+               epoch, lr, total_loss/steps, train_acc, test_acc);
         lr *= LR_DECAY;
     }
 
-    free(idx);
-    free(batch_x);
-    free(batch_y);
+    free(idx); free(batch_x); free(batch_y); free(scratch);
 }
 
-/* ---------------------------------------------------------------
-   Entry point
-   --------------------------------------------------------------- */
 int main(int argc, char **argv) {
     const char *data_dir    = (argc > 1) ? argv[1] : "./data";
     const char *weights_out = (argc > 2) ? argv[2] : "weights_v2.bin";
 
-    const double start = get_time_ms();
     srand((unsigned)time(NULL));
 
     char train_img[256], train_lbl[256], test_img[256], test_lbl[256];
-    snprintf(train_img, sizeof(train_img), "%s/train-images.idx3-ubyte", data_dir);
-    snprintf(train_lbl, sizeof(train_lbl), "%s/train-labels.idx1-ubyte", data_dir);
-    snprintf(test_img,  sizeof(test_img),  "%s/t10k-images.idx3-ubyte",  data_dir);
-    snprintf(test_lbl,  sizeof(test_lbl),  "%s/t10k-labels.idx1-ubyte",  data_dir);
+    snprintf(train_img, sizeof(train_img), "%s/train-images-idx3-ubyte", data_dir);
+    snprintf(train_lbl, sizeof(train_lbl), "%s/train-labels-idx1-ubyte", data_dir);
+    snprintf(test_img,  sizeof(test_img),  "%s/t10k-images-idx3-ubyte",  data_dir);
+    snprintf(test_lbl,  sizeof(test_lbl),  "%s/t10k-labels-idx1-ubyte",  data_dir);
 
     printf("Loading MNIST from %s ...\n", data_dir);
     MnistData train_d = {0}, test_d = {0};
@@ -150,26 +144,32 @@ int main(int argc, char **argv) {
     if (!mnist_load(test_img,  test_lbl,  &test_d))  return 1;
     printf("Train: %d   Test: %d\n\n", train_d.count, test_d.count);
 
-    printf("Config: epochs=%d  batch=%d  lr=%.3f decay=%.2f  dropout=%.1f\n",
+    AugmentCfg aug = augment_default();
+    aug.elastic_alpha = 8.0f;
+    aug.elastic_sigma = 3.0f;
+
+    int nthreads = 1;
+#ifdef _OPENMP
+    nthreads = omp_get_max_threads();
+#endif
+    printf("Threads: %d\n", nthreads);
+    printf("Config:  epochs=%d  batch=%d  lr=%.3f->%.2f  dropout=%.1f\n",
            EPOCHS, BATCH_SIZE, LR_INIT, LR_DECAY, DROPOUT_RATE);
-    printf("        momentum=%.2f  BN_eps=%.0e  BN_momentum=%.2f\n\n",
-           MOMENTUM, (double)BN_EPS, (double)BN_MOMENTUM);
+    printf("Augment: shift=+/-%dpx  rotate=+/-%.0fdeg  scale=+/-%.0f%%"
+           "  elastic(alpha=%.1f sigma=%.1f)\n\n",
+           aug.max_shift, aug.max_angle_deg, aug.scale_delta*100.0f,
+           aug.elastic_alpha, aug.elastic_sigma);
 
     Network *net = net_create();
     if (!net) { fprintf(stderr, "Out of memory\n"); return 1; }
 
-    train(net, &train_d, &test_d);
+    train(net, &train_d, &test_d, &aug);
 
     printf("----------------------------------------------\n");
     printf("Final test accuracy: %.2f%%\n", evaluate(net, &test_d));
-
     net_save(net, weights_out);
     net_free(net);
     mnist_free(&train_d);
     mnist_free(&test_d);
-
-    const double end = get_time_ms();
-    printf("Time: %lf ms\n", end - start);
-
     return 0;
 }

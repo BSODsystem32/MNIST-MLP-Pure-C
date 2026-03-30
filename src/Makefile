@@ -9,23 +9,31 @@ LDFLAGS = -lm
 # ---------------------------------------------------------------
 ifeq ($(OS),Windows_NT)
   EXE     := .exe
-  RM_F     = del /Q /F
   NULL     = NUL
   CURL     = curl -L --output
   DATADIR  = ..\data
   SEP      = $(strip \)
 else
   EXE     :=
-  RM_F     = rm -f
   NULL     = /dev/null
   CURL     = curl -L -o
   DATADIR  = ../data
   SEP      = /
 endif
 
+# ---------------------------------------------------------------
+# OpenMP — enabled by default, disable with: make OPENMP=0
+# macOS ships Clang without OpenMP; install via: brew install libomp
+# Windows MinGW: OpenMP is included in the default toolchain
+# ---------------------------------------------------------------
+OPENMP ?= 1
+ifeq ($(OPENMP),1)
+  CFLAGS  += -fopenmp
+  LDFLAGS += -fopenmp
+endif
+
 TARGET = mnist_mlp$(EXE)
-SRCS   = main.c mnist.c matrix.c network.c
-OBJS   = $(SRCS:.c=.o)
+OBJS   = main.o mnist.o matrix.o network.o augment.o
 
 .PHONY: all clean download
 
@@ -34,19 +42,33 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c
+# ---------------------------------------------------------------
+# Explicit compile rules with full header dependencies
+# ---------------------------------------------------------------
+main.o:    main.c    network.h mnist.h augment.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+mnist.o:   mnist.c   mnist.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+matrix.o:  matrix.c  matrix.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+network.o: network.c network.h matrix.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+augment.o: augment.c augment.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ---------------------------------------------------------------
-# clean — single target, branch on $(OS) inside the recipe
-# using cmd.exe syntax on Windows, sh syntax elsewhere
+# clean
 # ---------------------------------------------------------------
 clean:
 ifeq ($(OS),Windows_NT)
 	-del /Q /F $(OBJS) 2>$(NULL)
 	-del /Q /F $(TARGET) 2>$(NULL)
 else
-	$(RM_F) $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET)
 endif
 
 # ---------------------------------------------------------------
