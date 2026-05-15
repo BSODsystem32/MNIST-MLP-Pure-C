@@ -1,7 +1,12 @@
-# src/Makefile — training binary
+# Makefile — training binary
 
 CC      = gcc
-CFLAGS  = -std=c99 -O2 -Wall -Wextra -Wpedantic
+# -O3 -march=native: full loop vectorisation + target-specific SIMD
+# -ffast-math:       allows reassociation, reciprocal sqrt, etc.
+#                    (safe here: we don't rely on strict IEEE exceptions)
+# -funroll-loops:    unroll small inner loops (BN, dropout)
+CFLAGS  = -std=c99 -O3 -march=native -ffast-math -funroll-loops \
+          -Wall -Wextra -Wpedantic
 LDFLAGS = -lm
 
 # ---------------------------------------------------------------
@@ -24,7 +29,6 @@ endif
 # ---------------------------------------------------------------
 # OpenMP — enabled by default, disable with: make OPENMP=0
 # macOS ships Clang without OpenMP; install via: brew install libomp
-# Windows MinGW: OpenMP is included in the default toolchain
 # ---------------------------------------------------------------
 OPENMP ?= 1
 ifeq ($(OPENMP),1)
@@ -43,7 +47,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # ---------------------------------------------------------------
-# Explicit compile rules with full header dependencies
+# Explicit compile rules
 # ---------------------------------------------------------------
 main.o:    main.c    network.h mnist.h augment.h
 	$(CC) $(CFLAGS) -c -o $@ $<
