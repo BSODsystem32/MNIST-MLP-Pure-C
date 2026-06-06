@@ -13,6 +13,15 @@
       This keeps all [B×H] accesses row-major throughout.
    3. All pointers marked restrict where safe.
    4. dropout_forward: branch-free multiply instead of ternary.
+
+   Round 2 optimisations:
+   5. PCG32 replaces rand() in dropout_forward — no global lock, SIMD-friendly.
+   6. ReLU gate + dropout_backward fused into a single B×H pass in net_backward,
+      cutting one full memory round-trip per hidden layer.
+   7. bn_backward Pass 1: load xhat into a local before overwriting xmu in-place;
+      eliminates the aliasing that blocked auto-vectorisation.
+   8. MOMENTUM_UPDATE: #pragma GCC ivdep on the large W arrays (W1=200704 elems,
+      W2=32768) to enable AVX2 vectorisation.
 */
 
 #include "network.h"
@@ -21,6 +30,31 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+
+/* ---------------------------------------------------------------
+   PCG32 — fast, SIMD-friendly RNG to replace rand() in dropout.
+   No global lock, period 2^64, passes BigCrush.
+   --------------------------------------------------------------- */
+static uint64_t pcg_state = 0x853c49e6748fea9bULL;
+static uint64_t pcg_inc   = 0xda3e39cb94b95bdbULL;
+
+static inline uint32_t pcg32_fast(void) {
+    uint64_t old    = pcg_state;
+    pcg_state       = old * 6364136223846793005ULL + pcg_inc;
+    uint32_t xs     = (uint32_t)(((old >> 18u) ^ old) >> 27u);
+    uint32_t rot    = (uint32_t)(old >> 59u);
+    return (xs >> rot) | (xs << ((-rot) & 31u));
+}
+
+/* Seed from srand()-compatible value */
+static void __attribute__((unused)) pcg32_seed(uint64_t seed) {
+    pcg_state = 0u;
+    pcg_inc   = (seed << 1u) | 1u;
+    pcg32_fast();
+    pcg_state += 0x853c49e6748fea9bULL;
+    pcg32_fast();
+}
 
 /* ---------------------------------------------------------------
    Helpers
@@ -194,7 +228,10 @@ static void bn_backward(BNLayer * restrict bn,
     }
 
     /* Pass 1: dgamma, dbeta, and build dxh (store into dz temporarily)
-               and xmu (store into x_hat — we're done with it after this) */
+               and xmu (store into x_hat — we're done with it after this).
+               Load xhat_row[j] into a local BEFORE writing xmu_row[j];
+               both point to bn->x_hat, so without the local the alias
+               blocks auto-vectorisation. */
     memset(bn->dgamma, 0, H * sizeof(float));
     memset(bn->dbeta,  0, H * sizeof(float));
 
@@ -202,18 +239,19 @@ static void bn_backward(BNLayer * restrict bn,
     const float * restrict mean  = bn->mean;
 
     for (int i = 0; i < bs; i++) {
-        const float * restrict dout_row = dout     + i * H;
+        const float * restrict dout_row = dout      + i * H;
         const float * restrict xhat_row = bn->x_hat + i * H;
         const float * restrict zin_row  = bn->z_in  + i * H;
-        float       * restrict dz_row   = dz        + i * H;
+        float       * restrict dz_row   = dz         + i * H;
         float       * restrict xmu_row  = bn->x_hat + i * H; /* reuse x_hat as xmu */
 
         for (int j = 0; j < H; j++) {
             float do_j  = dout_row[j];
-            bn->dgamma[j] += do_j * xhat_row[j];
+            float xh_j  = xhat_row[j];          /* load before in-place write */
+            xmu_row[j]  = zin_row[j] - mean[j]; /* overwrite x_hat → xmu */
+            bn->dgamma[j] += do_j * xh_j;
             bn->dbeta[j]  += do_j;
-            dz_row[j]      = do_j * gamma[j];         /* dxh  */
-            xmu_row[j]     = zin_row[j] - mean[j];    /* x-mu */
+            dz_row[j]      = do_j * gamma[j];   /* dxh */
         }
     }
 
@@ -247,7 +285,8 @@ static void bn_backward(BNLayer * restrict bn,
 }
 
 /* ---------------------------------------------------------------
-   Dropout (inverted, in-place) — branch-free inner loop
+   Dropout (inverted, in-place) — PCG32 inner loop, SIMD-friendly.
+   rand() replaced with pcg32_fast(): no global lock, vectorisable.
    --------------------------------------------------------------- */
 static void dropout_forward(float * restrict out,
                             uint8_t * restrict mask,
@@ -259,28 +298,18 @@ static void dropout_forward(float * restrict out,
         if (mask) memset(mask, 1, n * sizeof(uint8_t));
         return;
     }
-    float keep  = 1.0f - dropout_rate;
-    float scale = 1.0f / keep;
+    float    keep      = 1.0f - dropout_rate;
+    float    scale     = 1.0f / keep;
+    /* threshold: keep neuron when pcg32 output < threshold (prob = keep) */
+    uint32_t threshold = (uint32_t)(keep * (float)UINT32_MAX);
     for (int i = 0; i < n; i++) {
-        int k  = ((float)rand() / (float)RAND_MAX) < keep ? 1 : 0;
+        int k   = (pcg32_fast() < threshold) ? 1 : 0;
         mask[i] = (uint8_t)k;
         out[i]  = in[i] * (k ? scale : 0.0f);
     }
 }
 
-static void dropout_backward(float *din,
-                             const float *dout,
-                             const uint8_t * restrict mask,
-                             int n, float dropout_rate)
-{
-    if (dropout_rate <= 0.0f) {
-        if (din != dout) memcpy(din, dout, n * sizeof(float));
-        return;
-    }
-    float scale = 1.0f / (1.0f - dropout_rate);
-    for (int i = 0; i < n; i++)
-        din[i] = mask[i] ? dout[i] * scale : 0.0f;
-}
+/* dropout_backward is now inlined into net_backward (fused with ReLU gate). */
 
 /* ---------------------------------------------------------------
    Forward pass
@@ -342,13 +371,17 @@ int net_correct(const Network * restrict net,
 }
 
 /* ---------------------------------------------------------------
-   Momentum-SGD update
+   Momentum-SGD update.
+   #pragma GCC ivdep tells the compiler there are no loop-carried
+   dependencies, enabling AVX2 vectorisation on the large W arrays
+   (W1: 200704 elems, W2: 32768 elems).
    --------------------------------------------------------------- */
 #define MOMENTUM_UPDATE(param, vel, grad, n, lr) do {        \
     float * restrict _p = (param);                           \
     float * restrict _v = (vel);                             \
     const float * restrict _g = (grad);                      \
     int _n = (n); float _lr = (lr);                          \
+    _Pragma("GCC ivdep")                                     \
     for (int _i = 0; _i < _n; _i++) {                       \
         _v[_i]  = MOMENTUM * _v[_i] + _g[_i];               \
         _p[_i] -= _lr * _v[_i];                              \
@@ -379,13 +412,19 @@ void net_backward(Network * restrict net,
     MOMENTUM_UPDATE(net->W3, net->vW3, net->dW3, OUTPUT_SIZE * HIDDEN2_SIZE, lr);
     MOMENTUM_UPDATE(net->b3, net->vb3, net->db3, OUTPUT_SIZE, lr);
 
-    /* Layer 2 backprop */
+    /* Layer 2 backprop.
+       Fused ReLU gate + dropout_backward in a single B×H pass:
+       saves one full memory round-trip vs calling each separately. */
     mat_mul(net->delta2, net->delta3, net->W3, bs, OUTPUT_SIZE, HIDDEN2_SIZE);
-    dropout_backward(net->delta2, net->delta2, net->mask2,
-                     bs * HIDDEN2_SIZE, dropout_rate);
-    /* ReLU2 gate — row-major, stride-1 */
-    for (int i = 0; i < bs * HIDDEN2_SIZE; i++)
-        net->delta2[i] *= (net->a2[i] > 0.0f ? 1.0f : 0.0f);
+    if (dropout_rate > 0.0f) {
+        float scale2 = 1.0f / (1.0f - dropout_rate);
+        for (int i = 0; i < bs * HIDDEN2_SIZE; i++)
+            net->delta2[i] *= (net->a2[i] > 0.0f ? 1.0f : 0.0f)
+                            * (net->mask2[i] ? scale2 : 0.0f);
+    } else {
+        for (int i = 0; i < bs * HIDDEN2_SIZE; i++)
+            net->delta2[i] *= (net->a2[i] > 0.0f ? 1.0f : 0.0f);
+    }
 
     bn_backward(&net->bn2, net->delta2, net->delta2, bs);
     MOMENTUM_UPDATE(net->bn2.gamma, net->bn2.v_gamma, net->bn2.dgamma,
@@ -399,12 +438,17 @@ void net_backward(Network * restrict net,
     MOMENTUM_UPDATE(net->W2, net->vW2, net->dW2, HIDDEN2_SIZE * HIDDEN1_SIZE, lr);
     MOMENTUM_UPDATE(net->b2, net->vb2, net->db2, HIDDEN2_SIZE, lr);
 
-    /* Layer 1 backprop */
+    /* Layer 1 backprop — same fused ReLU+dropout pattern. */
     mat_mul(net->delta1, net->delta2, net->W2, bs, HIDDEN2_SIZE, HIDDEN1_SIZE);
-    dropout_backward(net->delta1, net->delta1, net->mask1,
-                     bs * HIDDEN1_SIZE, dropout_rate);
-    for (int i = 0; i < bs * HIDDEN1_SIZE; i++)
-        net->delta1[i] *= (net->a1[i] > 0.0f ? 1.0f : 0.0f);
+    if (dropout_rate > 0.0f) {
+        float scale1 = 1.0f / (1.0f - dropout_rate);
+        for (int i = 0; i < bs * HIDDEN1_SIZE; i++)
+            net->delta1[i] *= (net->a1[i] > 0.0f ? 1.0f : 0.0f)
+                            * (net->mask1[i] ? scale1 : 0.0f);
+    } else {
+        for (int i = 0; i < bs * HIDDEN1_SIZE; i++)
+            net->delta1[i] *= (net->a1[i] > 0.0f ? 1.0f : 0.0f);
+    }
 
     bn_backward(&net->bn1, net->delta1, net->delta1, bs);
     MOMENTUM_UPDATE(net->bn1.gamma, net->bn1.v_gamma, net->bn1.dgamma,
